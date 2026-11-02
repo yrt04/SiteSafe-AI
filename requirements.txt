@@ -1,0 +1,7 @@
+ultralytics==8.4.152
+torch
+torchvision
+opencv-python
+websockets
+numpy
+
