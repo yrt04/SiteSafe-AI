@@ -24,6 +24,9 @@ DEFAULT_MODEL = (
     else "yolo11n.pt"
 )
 CONFIDENCE_THRESHOLD = 0.35
+IOU_THRESHOLD = 0.70
+CONTAINMENT_THRESHOLD = 0.30
+ALERT_COOLDOWN_SECONDS = 10.0
 JPEG_QUALITY = 75
 MAX_FPS = 30
 FRAME_WIDTH = 1280
@@ -39,6 +42,116 @@ PALETTE = [
     (128, 128, 0), (128, 0, 128), (0, 128, 128), (128, 64, 0),
     (64, 0, 128), (0, 128, 64), (255, 200, 100), (100, 200, 255),
 ]
+
+VIOLATION_LABELS = {
+    "NO_HELMET": "PPE Violation: Worker without safety helmet (NO_HELMET)",
+    "NO_VEST": "PPE Violation: Worker without high-visibility vest (NO_VEST)",
+}
+
+
+def box_containment_ratio(ppe_box: list[float], region_box: list[float]) -> float:
+    x1, y1, x2, y2 = ppe_box
+    rx1, ry1, rx2, ry2 = region_box
+
+    ppe_area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
+    if ppe_area <= 0.0:
+        return 0.0
+
+    ix1 = max(float(x1), float(rx1))
+    iy1 = max(float(y1), float(ry1))
+    ix2 = min(float(x2), float(rx2))
+    iy2 = min(float(y2), float(ry2))
+
+    inter_area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    return inter_area / ppe_area
+
+
+def centroid_in_box(ppe_box: list[float], container_box: list[float]) -> bool:
+    cx = 0.5 * (float(ppe_box[0]) + float(ppe_box[2]))
+    cy = 0.5 * (float(ppe_box[1]) + float(ppe_box[3]))
+    rx1, ry1, rx2, ry2 = container_box
+    return float(rx1) <= cx <= float(rx2) and float(ry1) <= cy <= float(ry2)
+
+
+def matches_person_region(
+    ppe_box: list[float],
+    region_box: list[float],
+    expanded_region_box: list[float],
+    containment_threshold: float = CONTAINMENT_THRESHOLD,
+) -> bool:
+    """Match a PPE box to an anatomical ROI via BCR >= threshold or expanded centroid fallback."""
+    if box_containment_ratio(ppe_box, region_box) >= containment_threshold:
+        return True
+    if box_containment_ratio(ppe_box, expanded_region_box) >= containment_threshold:
+        return True
+    return centroid_in_box(ppe_box, expanded_region_box)
+
+
+def evaluate_ppe_compliance(detections: list[dict]) -> list[dict]:
+    """Evaluate per-person helmet and vest compliance via anatomical ROI matching."""
+    persons = [d for d in detections if d["class"] == "Person"]
+    helmets = [d for d in detections if d["class"] == "helmet"]
+    no_helmets = [d for d in detections if d["class"] == "no_helmet"]
+    vests = [d for d in detections if d["class"] == "vest"]
+
+    violations: list[dict] = []
+
+    for person_idx, person in enumerate(persons):
+        px1, py1, px2, py2 = person["bbox"]
+        pw = max(1.0, float(px2 - px1))
+        ph = max(1.0, float(py2 - py1))
+
+        # Partition Person bounding box into anatomical Head (top 40%) and Torso (20%-80%) ROIs.
+        # Expand head ROI upward (-15% height) so hard hats sitting above the hairline still bind.
+        head_box = [px1, py1, px2, py1 + 0.40 * ph]
+        expanded_head_box = [
+            px1 - 0.10 * pw,
+            py1 - 0.15 * ph,
+            px2 + 0.10 * pw,
+            py1 + 0.40 * ph,
+        ]
+
+        torso_box = [px1, py1 + 0.20 * ph, px2, py1 + 0.80 * ph]
+        expanded_torso_box = [
+            px1 - 0.05 * pw,
+            py1 + 0.20 * ph,
+            px2 + 0.05 * pw,
+            py1 + 0.80 * ph,
+        ]
+
+        has_no_helmet = any(
+            matches_person_region(nh["bbox"], head_box, expanded_head_box)
+            for nh in no_helmets
+        )
+        has_helmet = any(
+            matches_person_region(h["bbox"], head_box, expanded_head_box)
+            for h in helmets
+        )
+        has_vest = any(
+            matches_person_region(v["bbox"], torso_box, expanded_torso_box)
+            for v in vests
+        )
+
+        if has_no_helmet or not has_helmet:
+            violations.append({
+                "type": "NO_HELMET",
+                "person_index": person_idx,
+                "person_bbox": [px1, py1, px2, py2],
+                "person_confidence": person["confidence"],
+                "reason": "explicit_no_helmet" if has_no_helmet else "missing_helmet_in_head_region",
+            })
+
+        if not has_vest:
+            violations.append({
+                "type": "NO_VEST",
+                "person_index": person_idx,
+                "person_bbox": [px1, py1, px2, py2],
+                "person_confidence": person["confidence"],
+                "reason": "missing_vest_in_torso_region",
+            })
+
+    return violations
+
 
 class ThreadedCamera:
     """Decouples OpenCV frame capture from the inference loop to avoid camera I/O stalls."""
@@ -141,6 +254,7 @@ class VideoStreamer:
         self.latest_annotated_frame = None
         self.total_detections = 0
         self.session_start = datetime.now()
+        self.last_alert_time: dict[str, float] = {}
 
     def _init_model(self):
         if self.model is not None:
@@ -225,6 +339,77 @@ class VideoStreamer:
     def _encode_frame(self, frame) -> str:
         _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         return base64.b64encode(buffer).decode("utf-8")
+
+    def _draw_violations(self, frame, violations: list[dict]):
+        """Overlay consolidated per-worker alert badges on non-compliant Person boxes."""
+        by_person: dict[int, tuple[list[int], list[str]]] = {}
+        for v in violations:
+            p_idx = v["person_index"]
+            if p_idx not in by_person:
+                by_person[p_idx] = (v["person_bbox"], [])
+            by_person[p_idx][1].append(v["type"])
+
+        alert_bgr = (36, 36, 255)
+        for bbox, v_types in by_person.values():
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), alert_bgr, 3)
+            tag = f"ALERT: {', '.join(v_types)}"
+            (tw, th), baseline = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+            # Clamp badge inside frame bottom so floor-level detections remain legible.
+            tag_y2 = min(frame.shape[0] - 2, y2 + th + baseline + 8)
+            tag_y1 = tag_y2 - th - baseline - 6
+            cv2.rectangle(frame, (x1, tag_y1), (x1 + tw + 8, tag_y2), alert_bgr, -1)
+            cv2.putText(
+                frame,
+                tag,
+                (x1 + 4, tag_y2 - baseline - 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _process_violation_cooldowns(self, violations: list[dict], frame) -> list[dict]:
+        """Gate alerts and evidence snapshots behind a per-violation cooldown window."""
+        if not violations:
+            return []
+
+        now_epoch = time.time()
+        now_dt = datetime.now()
+        grouped_counts: dict[str, int] = {}
+        for v in violations:
+            v_type = v["type"]
+            grouped_counts[v_type] = grouped_counts.get(v_type, 0) + 1
+
+        triggered: list[dict] = []
+        for v_type, count in grouped_counts.items():
+            # Enforce 10s cooldown per violation type to mitigate dashboard alert fatigue and disk I/O spam.
+            if now_epoch - self.last_alert_time.get(v_type, 0.0) >= ALERT_COOLDOWN_SECONDS:
+                self.last_alert_time[v_type] = now_epoch
+
+                SCREENSHOTS_DIR.mkdir(exist_ok=True)
+                ts_file = now_dt.strftime("%Y%m%d_%H%M%S_%f")
+                filename = f"violation_{v_type}_{ts_file}.jpg"
+                snapshot_path = SCREENSHOTS_DIR / filename
+                cv2.imwrite(str(snapshot_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                print(f"[ALERT] {v_type} ({count} worker(s)) -> {snapshot_path}")
+
+                base_label = VIOLATION_LABELS.get(v_type, f"PPE Violation: {v_type}")
+                msg = f"{base_label} ({count} workers)" if count > 1 else base_label
+                triggered.append({
+                    "type": "violation_alert",
+                    "id": f"viol-{v_type}-{int(now_epoch * 1000)}",
+                    "violation_type": v_type,
+                    "severity": "high",
+                    "message": msg,
+                    "count": count,
+                    "timestamp": now_dt.strftime("%I:%M:%S %p"),
+                    "iso_timestamp": now_dt.isoformat(timespec="milliseconds"),
+                    "snapshot_path": str(snapshot_path).replace("\\", "/"),
+                })
+
+        return triggered
 
     def start_recording(self) -> dict:
         if self.is_recording:
@@ -414,17 +599,28 @@ class VideoStreamer:
                 results = self.model.predict(
                     source=frame,
                     conf=CONFIDENCE_THRESHOLD,
+                    iou=IOU_THRESHOLD,
                     verbose=False,
                     device=self.device,
                 )
                 detections = self._annotate_frame(frame, results)
+                frame_violations = evaluate_ppe_compliance(detections)
+                if frame_violations:
+                    self._draw_violations(frame, frame_violations)
+
                 self.latest_annotated_frame = frame.copy()
+                triggered_violations = self._process_violation_cooldowns(
+                    frame_violations, self.latest_annotated_frame
+                )
 
                 if self.is_recording and self.video_writer:
                     self.video_writer.write(frame)
                     self.frames_recorded += 1
 
                 self.total_detections += len(detections)
+
+                for alert_event in triggered_violations:
+                    await self._broadcast(json.dumps(alert_event))
 
                 frame_b64 = self._encode_frame(frame)
                 await self._broadcast(json.dumps({
@@ -433,6 +629,8 @@ class VideoStreamer:
                     "data": frame_b64,
                     "timestamp": datetime.now().isoformat(timespec="milliseconds"),
                     "detections": detections,
+                    "violations": triggered_violations,
+                    "active_violation_count": len(frame_violations),
                     "fps": round(fps_smooth, 1),
                     "detection_count": len(detections),
                     "total_detections": self.total_detections,

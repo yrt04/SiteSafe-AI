@@ -8,12 +8,24 @@ interface Detection {
   bbox: [number, number, number, number];
 }
 
+interface ViolationAlertPayload {
+  type?: 'violation_alert';
+  id: string;
+  violation_type: string;
+  severity: 'high' | 'medium' | 'low' | 'info';
+  message: string;
+  timestamp: string;
+  snapshot_path?: string;
+}
+
 interface FrameMessage {
   type: 'frame';
   camera_id: string;
   data: string;
   timestamp: string;
   detections: Detection[];
+  violations?: ViolationAlertPayload[];
+  active_violation_count?: number;
   fps: number;
   detection_count: number;
   total_detections: number;
@@ -38,8 +50,10 @@ interface VideoFeedProps {
   onExpand?: (id: string) => void;
   onStatsUpdate?: (stats: StreamStats) => void;
   onNewAlert?: (alert: {
+    id?: string;
     message: string;
     severity: 'high' | 'medium' | 'low' | 'info';
+    timestamp?: string;
   }) => void;
 }
 
@@ -53,6 +67,7 @@ const STATUS_LABELS: Record<FeedStatus, string> = {
 };
 
 const RECONNECT_DELAY_MS = 3000;
+const MAX_SEEN_ALERT_IDS = 100;
 
 export default function VideoFeed({
   id,
@@ -74,6 +89,27 @@ export default function VideoFeed({
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenAlertIdsRef = useRef<Set<string>>(new Set());
+
+  // Deduplicate dual-path alerts (standalone event + frame payload) with bounded FIFO eviction.
+  const emitViolationAlert = useCallback((violation: ViolationAlertPayload) => {
+    if (!onNewAlert) return;
+    const alertId = violation.id || `viol-${violation.violation_type}-${Date.now()}`;
+    if (seenAlertIdsRef.current.has(alertId)) return;
+
+    seenAlertIdsRef.current.add(alertId);
+    if (seenAlertIdsRef.current.size > MAX_SEEN_ALERT_IDS) {
+      const oldest = seenAlertIdsRef.current.values().next().value;
+      if (oldest) seenAlertIdsRef.current.delete(oldest);
+    }
+
+    onNewAlert({
+      id: alertId,
+      message: violation.message,
+      severity: violation.severity || 'high',
+      timestamp: violation.timestamp,
+    });
+  }, [onNewAlert]);
 
   useEffect(() => {
     const syncClock = () => setClockText(new Date().toLocaleTimeString());
@@ -123,6 +159,11 @@ export default function VideoFeed({
             uptime: frameMsg.uptime_seconds,
           });
 
+          if (Array.isArray(frameMsg.violations) && frameMsg.violations.length > 0) {
+            frameMsg.violations.forEach(emitViolationAlert);
+          }
+        } else if (msg.type === 'violation_alert') {
+          emitViolationAlert(msg as ViolationAlertPayload);
         } else if (msg.type === 'recording_status') {
           setIsRecording(msg.recording);
           if (msg.message) {
@@ -156,7 +197,7 @@ export default function VideoFeed({
     };
 
     ws.onerror = () => ws.close();
-  }, [wsUrl, id, onStatsUpdate, onNewAlert]);
+  }, [wsUrl, id, onStatsUpdate, onNewAlert, emitViolationAlert]);
 
   useEffect(() => {
     connectWebSocket();

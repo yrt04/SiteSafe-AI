@@ -23,6 +23,9 @@ export default function Dashboard() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [timelineEvents, setTimelineEvents] = useState<TimelineEvent[]>([]);
 
+  // Monotonic sequence prevents React key collisions when multiple violations fire in the same millisecond.
+  const alertSeqRef = useRef(0);
+
   const handleStatsUpdate = useCallback((stats: StreamStats) => {
     setActiveDetections(stats.activeDetections);
     setTotalDetections(stats.totalDetections);
@@ -30,12 +33,15 @@ export default function Dashboard() {
   }, []);
 
   const handleNewAlert = useCallback((alertData: {
+    id?: string;
     message: string;
     severity: 'high' | 'medium' | 'low' | 'info';
+    timestamp?: string;
   }) => {
     const now = new Date();
-    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const baseId = `${now.getTime()}`;
+    const timeStr = alertData.timestamp || now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    alertSeqRef.current += 1;
+    const baseId = alertData.id || `${now.getTime()}-${alertSeqRef.current}`;
 
     const nextAlert: Alert = {
       id: `alert-${baseId}`,
